@@ -4480,6 +4480,26 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	u.RequestID = requestID(res.Header)
 	if res.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		// A vendor's refusal is kept whole before APIError narrows it to a
+		// line: the status, the content type, the vendor's own request id
+		// and the body, so "Codex: Bad Request" can be taken back to the
+		// vendor afterwards. Only refusals magpie can't put in words are
+		// kept — an overflow, a quota or a safety filter already says what
+		// happened in magpie's own words (p.Explain).
+		if !namedRefusal(p, res.StatusCode, b) {
+			who := access.Caller(r.Context())
+			KeepErrBody(ErrBodyRecord{
+				Provider:    p.ID,
+				Model:       model,
+				RouteID:     routeIDOf(r.Context()),
+				CallerKey:   who.KeyName,
+				CallerKeyID: who.KeyID,
+				Status:      res.StatusCode,
+				ContentType: res.Header.Get("Content-Type"),
+				UpstreamID:  upstreamRequestID(res.Header),
+				Body:        string(b),
+			})
+		}
 		msg := p.Explain(p.Name+": "+provider.APIError(b, res.Status), res.StatusCode, b)
 		if wrongEndpoint(res.StatusCode, b) {
 			s.markUnfit(p.ID, model, proto)
@@ -5636,6 +5656,26 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	u.RequestID = requestID(res.Header)
 	if res.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		// A vendor's refusal is kept whole before APIError narrows it to a
+		// line: the status, the content type, the vendor's own request id
+		// and the body, so "Codex: Bad Request" can be taken back to the
+		// vendor afterwards. Only refusals magpie can't put in words are
+		// kept — an overflow, a quota or a safety filter already says what
+		// happened in magpie's own words (p.Explain).
+		if !namedRefusal(p, res.StatusCode, b) {
+			who := access.Caller(r.Context())
+			KeepErrBody(ErrBodyRecord{
+				Provider:    p.ID,
+				Model:       model,
+				RouteID:     routeIDOf(r.Context()),
+				CallerKey:   who.KeyName,
+				CallerKeyID: who.KeyID,
+				Status:      res.StatusCode,
+				ContentType: res.Header.Get("Content-Type"),
+				UpstreamID:  upstreamRequestID(res.Header),
+				Body:        string(b),
+			})
+		}
 		msg := p.Explain(p.Name+": "+provider.APIError(b, res.Status), res.StatusCode, b)
 		if wrongEndpoint(res.StatusCode, b) {
 			msg += wrongAPINote(p, model, res, b)
