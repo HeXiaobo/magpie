@@ -1049,6 +1049,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		// relay issued, left in ~/.codex/auth.json — and one of Codex's own
 		// models was picked, which goes out with Codex's own sign-in
 		msg, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		keepRefusal(r.Context(), provider.Provider{ID: "openai", Name: "OpenAI"}, modelOf(body), res.StatusCode, res.Header, msg)
 		writeError(w, provider.Responses, res.StatusCode, codexKeyRefused(msg))
 		s.record(Call{Time: start, From: provider.Responses, To: provider.Responses, Model: modelOf(body),
 			Provider: "openai", Agent: agentOf(r), Status: res.StatusCode,
@@ -1059,6 +1060,10 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 	if rest == "/responses" && res.StatusCode >= 400 {
 		msg, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		res.Body = io.NopCloser(bytes.NewReader(msg))
+		// Codex's own backend answers here, never reaching the three
+		// protocol paths: without this line a Codex refusal off this route
+		// keeps only the short error the agent saw.
+		keepRefusal(r.Context(), provider.Provider{ID: "openai", Name: "OpenAI"}, modelOf(body), res.StatusCode, res.Header, msg)
 		if len(bytes.TrimSpace(msg)) == 0 {
 			// a failure with nothing said of it, which Codex shows as
 			// "Unknown error" alone (#409): said where the turn went

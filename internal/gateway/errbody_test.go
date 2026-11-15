@@ -40,55 +40,138 @@ func errBodyLines(t *testing.T) []ErrBodyRecord {
 	return out
 }
 
-// A vendor's refusal is kept with its status, content type, its own request
-// id and the body, so "Codex: Bad Request" can be taken back to the vendor.
-func TestErrBodyKeepsRefusal(t *testing.T) {
+// keep is KeepErrBody from a vendor body, as the paths do it.
+func keep(t *testing.T, status int, body string) ErrBodyRecord {
+	t.Helper()
+	rec, ok := ErrBodyFrom([]byte(body))
+	if !ok {
+		t.Fatalf("nothing kept from %q", body)
+	}
+	rec.Provider = "codex"
+	rec.Model = "gpt-6.1-sol"
+	rec.RouteID = "1794439898674"
+	rec.CallerKey = "mini-codex"
+	rec.Status = status
+	rec.ContentType = "application/json"
+	if p := KeepErrBody(rec); p == "" {
+		t.Fatal("no path written")
+	}
+	recs := errBodyLines(t)
+	return recs[len(recs)-1]
+}
+
+// The vendor's diagnostic fields survive, so "Codex: Bad Request" can be
+// taken back to the vendor.
+func TestErrBodyKeepsDiagnostics(t *testing.T) {
 	errBodyTestDir(t)
 
-	path := KeepErrBody(ErrBodyRecord{
-		Provider:    "codex",
-		Model:       "gpt-6.1-sol",
-		RouteID:     "1794439898674",
-		CallerKey:   "mini-codex",
-		CallerKeyID: "abc123",
-		Status:      400,
-		ContentType: "application/json",
-		UpstreamID:  "x-request-id=req_9f8e7d",
-		Body:        `{"error":{"message":"Unsupported parameter: 'reasoning.effort'","type":"invalid_request_error","code":"unsupported_parameter"}}`,
-	})
-	if path == "" {
-		t.Fatal("no path written")
+	got := keep(t, 400, `{"error":{"message":"Unsupported parameter: 'reasoning.effort'","type":"invalid_request_error","code":"unsupported_parameter","param":"reasoning.effort"}}`)
+	if got.Status != 400 || got.Provider != "codex" || got.RouteID != "1794439898674" {
+		t.Errorf("identity lost: %+v", got)
+	}
+	if got.CallerKey != "mini-codex" {
+		t.Errorf("callerKeyName = %q", got.CallerKey)
+	}
+	if got.ErrCode != "unsupported_parameter" || got.ErrParam != "reasoning.effort" {
+		t.Errorf("code/param lost: %+v", got)
+	}
+	if !strings.Contains(got.Message, "Unsupported parameter") {
+		t.Errorf("message lost: %q", got.Message)
+	}
+	if got.BodyShape != "json" || got.BodyLen == 0 {
+		t.Errorf("shape/len lost: %+v", got)
+	}
+}
+
+// A credential a vendor echoes back — in a field named for one, or as an
+// opaque value with no key shape — never reaches the file (review 1).
+func TestErrBodyNoCredentialEcho(t *testing.T) {
+	errBodyTestDir(t)
+
+	const secret = "opaque-session-7D4A92C185EF"
+	got := keep(t, 401, `{"error":{"message":"unauthorized","headers":{"Authorization":"Bearer `+secret+`","Cookie":"session=`+secret+`"}}}`)
+	if strings.Contains(got.Message, secret) {
+		t.Fatalf("the credential is in the message: %q", got.Message)
+	}
+	b, _ := os.ReadFile(ErrBodyPath())
+	if strings.Contains(string(b), secret) {
+		t.Fatalf("the credential is in the file: %s", b)
+	}
+}
+
+// The caller's own content, echoed back in a vendor's invalid-value error,
+// is not archived (review 2): only the diagnostic fields are, and the
+// message the caller sent is never among them.
+func TestErrBodyNoCustomerEcho(t *testing.T) {
+	errBodyTestDir(t)
+
+	const customer = "客户星河合同底价为人民币七十三万元"
+	got := keep(t, 400, `{"error":{"message":"Invalid value: `+customer+`","param":"messages[0].content","code":"invalid_value"}}`)
+	if got.ErrParam != "messages[0].content" {
+		t.Errorf("the parameter name is the diagnostic and should stay: %q", got.ErrParam)
+	}
+	if got.ErrCode != "invalid_value" {
+		t.Errorf("code lost: %q", got.ErrCode)
+	}
+	// the message is the vendor's sentence around the echo: what the caller
+	// sent must not appear. A vendor that puts the whole input in message
+	// leaves only what it wrapped it in.
+	b, _ := os.ReadFile(ErrBodyPath())
+	if strings.Contains(string(b), customer) {
+		t.Fatalf("the caller's content is in the file: %s", b)
+	}
+}
+
+// A body that isn't JSON is named by shape, never archived: it can be the
+// caller's own content echoed back.
+func TestErrBodyTextBodyNotArchived(t *testing.T) {
+	errBodyTestDir(t)
+
+	const page = "<html>Request has been blocked. incident=review-123. 客户星河</html>"
+	got := keep(t, 403, page)
+	if got.BodyShape != "text" {
+		t.Errorf("shape = %q, want text", got.BodyShape)
+	}
+	if got.Message != "" {
+		t.Errorf("a text body's words were kept: %q", got.Message)
+	}
+	b, _ := os.ReadFile(ErrBodyPath())
+	if strings.Contains(string(b), "review-123") || strings.Contains(string(b), "客户星河") {
+		t.Fatalf("the text body is in the file: %s", b)
+	}
+}
+
+// A firewall's 403 is a refusal like any other and is kept (review 4): naming
+// it in plain words for the agent doesn't archive what the vendor sent.
+func TestErrBodyFirewallRefusalKept(t *testing.T) {
+	errBodyTestDir(t)
+
+	body := `<html>Request has been blocked. incident=review-123</html>`
+	if p := KeepErrBody(mustRec(t, 403, body)); p == "" {
+		t.Fatal("a firewall refusal was dropped")
 	}
 	recs := errBodyLines(t)
 	if len(recs) != 1 {
 		t.Fatalf("want 1 record, got %d", len(recs))
 	}
-	got := recs[0]
-	if got.Status != 400 {
-		t.Errorf("status = %d, want 400", got.Status)
+	if recs[0].Status != 403 || recs[0].BodyShape != "text" {
+		t.Errorf("firewall refusal not recorded: %+v", recs[0])
 	}
-	if got.Provider != "codex" || got.Model != "gpt-6.1-sol" || got.RouteID != "1794439898674" {
-		t.Errorf("identity lost: %+v", got)
-	}
-	if got.CallerKey != "mini-codex" {
-		t.Errorf("callerKeyName = %q, want mini-codex", got.CallerKey)
-	}
-	if got.UpstreamID != "x-request-id=req_9f8e7d" {
-		t.Errorf("upstreamRequestId = %q", got.UpstreamID)
-	}
-	if !strings.Contains(got.Body, "unsupported_parameter") {
-		t.Errorf("body lost the vendor's words: %q", got.Body)
-	}
-	if got.Time == "" {
-		t.Error("no timestamp")
-	}
+}
+
+func mustRec(t *testing.T, status int, body string) ErrBodyRecord {
+	t.Helper()
+	rec, _ := ErrBodyFrom([]byte(body))
+	rec.Provider = "codex"
+	rec.Status = status
+	return rec
 }
 
 // A success is not kept: only refusals are.
 func TestErrBodySkipsSuccess(t *testing.T) {
 	errBodyTestDir(t)
 
-	if p := KeepErrBody(ErrBodyRecord{Provider: "codex", Status: 200, Body: "fine"}); p != "" {
+	if p := KeepErrBody(ErrBodyRecord{Provider: "codex", Status: 200}); p != "" {
 		t.Fatalf("a 200 was kept at %s", p)
 	}
 	if _, err := os.Stat(ErrBodyPath()); !os.IsNotExist(err) {
@@ -96,45 +179,14 @@ func TestErrBodySkipsSuccess(t *testing.T) {
 	}
 }
 
-// Only the first 4 KiB of the body is kept, so one huge reply can't fill the
-// disk; what is kept is still a prefix of what the vendor said.
-func TestErrBodyCutsLongBody(t *testing.T) {
+// A very long vendor message is cut, so one refusal can't fill the disk.
+func TestErrBodyCutsLongMessage(t *testing.T) {
 	errBodyTestDir(t)
 
 	long := strings.Repeat("x", errBodyMost*3)
-	KeepErrBody(ErrBodyRecord{Provider: "codex", Status: 400, Body: long})
-	recs := errBodyLines(t)
-	if len(recs) != 1 {
-		t.Fatalf("want 1 record, got %d", len(recs))
-	}
-	if len(recs[0].Body) > errBodyMost {
-		t.Fatalf("kept %d bytes, want at most %d", len(recs[0].Body), errBodyMost)
-	}
-	if recs[0].BodyLen != len(recs[0].Body) {
-		t.Errorf("bodyLen = %d, body is %d", recs[0].BodyLen, len(recs[0].Body))
-	}
-}
-
-// A secret in the body never reaches the file, and the vendor's own words
-// still do.
-func TestErrBodyScrubsSecrets(t *testing.T) {
-	errBodyTestDir(t)
-
-	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"
-	KeepErrBody(ErrBodyRecord{
-		Provider: "codex",
-		Status:   401,
-		Body:     `{"error":{"message":"Incorrect API key provided: ` + key + `"}}`,
-	})
-	recs := errBodyLines(t)
-	if len(recs) != 1 {
-		t.Fatalf("want 1 record, got %d", len(recs))
-	}
-	if strings.Contains(recs[0].Body, key) {
-		t.Fatalf("the key is in the file: %q", recs[0].Body)
-	}
-	if !strings.Contains(recs[0].Body, "Incorrect API key provided") {
-		t.Errorf("scrubbing lost the vendor's words: %q", recs[0].Body)
+	got := keep(t, 400, `{"error":{"message":"`+long+`"}}`)
+	if len(got.Message) > errBodyMost {
+		t.Fatalf("kept %d bytes, want at most %d", len(got.Message), errBodyMost)
 	}
 }
 
@@ -145,7 +197,10 @@ func TestErrBodyRotates(t *testing.T) {
 
 	big := strings.Repeat("y", errBodyMost)
 	for i := 0; i < (errBodyLimit/errBodyMost)+2; i++ {
-		KeepErrBody(ErrBodyRecord{Provider: "codex", Status: 400, Body: big})
+		rec, _ := ErrBodyFrom([]byte(`{"error":{"message":"` + big + `"}}`))
+		rec.Provider = "codex"
+		rec.Status = 400
+		KeepErrBody(rec)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "magpie", ErrBodyOld)); err != nil {
 		t.Fatalf("no rotated file: %v", err)
