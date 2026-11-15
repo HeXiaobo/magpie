@@ -59,7 +59,7 @@ function server(lang, asked, refreshed) {
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme: "light" }, fx: { rate: 7.2, at: new Date().toISOString() } });
     if (url.pathname === "/api/usage/requests") {
       refreshed.n++;
-      return json({ period: "30d", rows: ROWS, offset: 0, total: ROWS.length, calls: ROWS.length, errors: 0, input: 23, output: 13, cache_read: 0, cache_write: 0, reasoning: 0, cost: 0.02, unpriced: 0, bucket: "day", series: [], by: { provider: [], agent: [], model: [] }, agents: [], providers: [] });
+      return json({ period: "30d", rows: ROWS, offset: 0, total: ROWS.length, calls: ROWS.length, errors: 0, input: 23 + (refreshed.input || 0), output: 13, cache_read: 0, cache_write: 0, reasoning: 0, cost: 0.02, unpriced: 0, bucket: "day", series: [], by: { provider: [], agent: [], model: [] }, agents: [], providers: [] });
     }
     if (url.pathname === "/api/usage/requests/content") {
       const q = url.searchParams;
@@ -87,7 +87,7 @@ const L = {
     why: ["No session was named with this request, so its session file can't be found", "magpie reads the session files of Claude Code, Claude Desktop and Codex only", "This request isn't in the agent's session files: they may be deleted, moved, or not written yet"],
     src: "Read from the agent's session file; magpie keeps no copy" },
   zh: { loading: "加载中…", input: "输入", output: "输出", roles: ["你", "上下文"], out: ["思考", "助手", "工具调用", "助手"], tool: "工具结果", more: "展开全部", less: "收起", cut: "……还有 250 个字符未显示", whole: "内容太多，这里只显示了一部分",
-    why: ["这个请求没有带会话 ID，找不到它的会话文件", "magpie 只读 Claude Code、Claude Desktop 和 Codex 的会话文件", "在 Agent 的会话文件里找不到这个请求：文件可能已被删除、移走，或者还没写入"],
+    why: ["此请求未带会话 ID，找不到其会话文件", "magpie 只读 Claude Code、Claude Desktop 和 Codex 的会话文件", "Agent 会话文件中没有此请求：文件可能已删除、移走或尚未写入"],
     src: "读自 Agent 的会话文件，magpie 不保存副本" },
 };
 
@@ -108,7 +108,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await p.route("**/*", server(lang, asked, refreshed));
         await p.goto("http://magpie.test/");
         await p.locator('[data-view="usage"]').first().click();
-        await p.locator("#usageTab .opt").nth(1).click();
+        await p.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
         await p.locator("#ledWrap .led tbody tr").first().waitFor();
         const rows = p.locator(".led tbody tr.led-row");
 
@@ -135,6 +135,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const tall = await long.locator(".cx-t").evaluate((e) => e.getBoundingClientRect().height);
         assert(tall > short * 2, `the whole is taller: ${short} → ${tall}`);
         assert.equal((await long.locator(".cx-more").textContent()).trim(), w.less);
+        refreshed.input = 1;
+        await reader.click(p, p.locator("#usageReload"));
+        await p.waitForTimeout(350);
+        await p.locator(".led-cx .cx-sec").first().waitFor();
+        const collapsed = await long.evaluate(e => e.classList.contains("clamp"));
+        t.diagnostic("After changed ledger refresh: long content collapsed=" + collapsed);
+        assert.equal(collapsed, false, "refresh must retain expanded request text");
+        assert.equal((await long.locator(".cx-more").textContent()).trim(), w.less);
+        await reader.click(p, long.locator(".cx-more"));
+        refreshed.input = 2;
+        await reader.click(p, p.locator("#usageReload"));
+        await p.waitForTimeout(350);
+        await p.locator(".led-cx .cx-sec").first().waitFor();
+        assert(await long.evaluate(e => e.classList.contains("clamp")), "refresh also retains the reader's collapse choice");
+        assert.equal((await long.locator(".cx-more").textContent()).trim(), w.more);
+
         assert.equal((await p.locator(".led-cx .cx-part .cx-t").last().textContent()).replace(/\s+/g, " ").trim(), "the end of a part " + w.cut);
         assert.equal((await p.locator(".led-cx .cx-none").textContent()).trim(), w.whole);
         assert.equal((await p.locator(".led-cx .cx-src").textContent()).trim(), w.src);
@@ -202,7 +218,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await p.route("**/*", server("en", asked, refreshed));
       await p.goto("http://magpie.test/");
       await p.locator('[data-view="usage"]').first().click();
-      await p.locator("#usageTab .opt").nth(1).click();
+      await p.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
       await p.locator("#ledWrap .led tbody tr").first().waitFor();
       await reader.click(p, p.locator(".led tbody tr.led-row").nth(0));
       await p.locator(".led-cx .cx-sec").first().waitFor();

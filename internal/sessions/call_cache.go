@@ -20,7 +20,28 @@ import (
 
 // v3 persists Codex cumulative counters explicitly; v2 shards can contain
 // inflated deltas after a reload, so rebuild their derived rows from source.
-const callCacheVersion = "calls-v3"
+// v4: a Codex call's input no longer holds what it wrote to the cache (#589).
+// v5: an OpenCode call keeps the effort its prompt asked for (#680).
+// v6: Codex response records and compact disk-only parser state.
+// v7: reconcile recent Claude message revisions.
+// v8: a Claude Code call's 1-hour cache writes.
+// v9: a dsh call carries the provider it named and the model that answered,
+// and a call through magpie's own gateway is left out of dsh's (the gateway
+// logs it itself).
+// v10: the calls ZCode's and WorkBuddy's session files hold are read too, and
+// WorkBuddy's that went through the gateway are left out of them as a dsh
+// one is.
+// v12: a ZCode call's input leaves out the cache, and its output the
+// reasoning counted twice, as its session's summary does (#1947).
+// v13: a call after a compaction carries how long the compaction took
+// (Compact): Claude Code's compact_boundary durationMs, Codex's compaction
+// call's own time.
+// v14: Codex calls keep the thread that made the request.
+// v15: Codex calls keep the compaction marker independently of its duration.
+// What each version names is what a cache of the one before it cannot serve:
+// the version is part of the directory's name, so a cache written by an older
+// one is never read (pruneCalls).
+const callCacheVersion = "calls-v15"
 const maxKeptCalls = 131072
 const maxKeptFiles = 64
 
@@ -39,15 +60,28 @@ func resetCalls() {
 	callsMu.Lock()
 	defer callsMu.Unlock()
 	callCache, callOrder = map[string]*callFile{}, nil
+	callContinuations, callContinuationOrder = map[string]callContinuation{}, nil
 	callCounts = map[string]int{}
 	callRoot = ""
 	callGeneration++
+	resetOCCalls()
+	// ZCode's listing and WorkBuddy's gateway ids name another HOME's files
+	// and models.json: a read after a Reset() would otherwise hand back
+	// sources that are not here. Both are stamped, so the stale stamp alone
+	// would miss; clearing them makes a new HOME read its own
+	zcCallList.Lock()
+	zcCallList.stamp, zcCallList.files = "", nil
+	zcCallList.Unlock()
+	wbGateway.Lock()
+	wbGateway.byPath = nil
+	wbGateway.Unlock()
 }
 
 func pruneCalls(files []file) {
 	root := callCacheDir()
 	callsMu.Lock()
-	if callRoot != root {
+	moved := callRoot != root
+	if moved {
 		callGeneration++
 		callCache, callOrder, callRoot = map[string]*callFile{}, nil, root
 		callCounts = map[string]int{}
@@ -72,7 +106,27 @@ func pruneCalls(files []file) {
 			delete(callCounts, path)
 		}
 	}
+	order = callContinuationOrder[:0]
+	for _, path := range callContinuationOrder {
+		if on[path] {
+			order = append(order, path)
+		} else {
+			delete(callContinuations, path)
+		}
+	}
+	callContinuationOrder = order
+
+	trimCallRevisions(time.Now())
 	callsMu.Unlock()
+	if moved {
+		// an older version's shards are never read again
+		olds, _ := filepath.Glob(filepath.Join(filepath.Dir(root), "calls-v*"))
+		for _, old := range olds {
+			if old != root {
+				_ = os.RemoveAll(old)
+			}
+		}
+	}
 	// IO never holds the metadata lock. A grace period protects live writers.
 	entries, _ := os.ReadDir(root)
 	for _, e := range entries {
@@ -92,6 +146,7 @@ func pruneCalls(files []file) {
 }
 
 func keepCalls(path string, st *callFile) {
+	defer trimCallRevisions(time.Now())
 	callCounts[path] = len(st.Calls)
 	delete(callCache, path)
 	order := callOrder[:0]
@@ -118,6 +173,24 @@ func keepCalls(path string, st *callFile) {
 	callOrder = append(callOrder, path)
 }
 
+// wholeCallReaders read an agent's calls from one session file at a time,
+// rather than a line at a time: its calls are not lines, or its file cannot
+// be read on from the middle of one. Every agent in callSources that is not
+// in callFiles needs an entry here, or its calls are never read.
+var wholeCallReaders = map[string]func(file) (*callFile, bool){
+	"opencode":  readOpenCodeCalls,
+	"zcode":     readZCodeCalls,
+	"dsh":       readDshCalls,
+	"workbuddy": readWorkBuddyCalls,
+	"codebuddy": readWorkBuddyCalls, // #1779
+	// #1605
+	"minimax-code": readMiniMaxCalls,
+	"kimi":         readKimiCalls, // #1607
+	"pi":           readPiCalls,   // #1951
+	"omp":          readPiCalls,
+	"agy":          readAgyCalls, // #2097
+}
+
 func readCalls(f file) *callFile {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(f.path))
@@ -128,7 +201,7 @@ func readCalls(f file) *callFile {
 	old, generation := callCache[f.path], callGeneration
 	callsMu.Unlock()
 	if old == nil {
-		old = loadCalls(f)
+		old = restoreCallContinuation(loadCalls(f))
 	}
 	if old != nil && old.Size == f.size && old.Mod == f.mod.UnixNano() {
 		callsMu.Lock()
@@ -137,6 +210,36 @@ func readCalls(f file) *callFile {
 		}
 		callsMu.Unlock()
 		return old
+	}
+	if f.cold || wslCold(f.path) {
+		// in a stopped WSL distro: opening it would start it
+		if old != nil {
+			return old
+		}
+		return &callFile{Path: f.path, Agent: f.agent}
+	}
+	// a file to read: few at once while only the warm-up asks (quiet.go)
+	defer readSlot()()
+	defer readBegin()()
+	// Agents whose calls are read whole rather than line by line: a session
+	// that changed is read again, and one that did not is kept. OpenCode's
+	// and ZCode's are rows of a database or JSON documents; dsh's file is
+	// packed in frames, so it cannot be read on from the middle of one.
+	if read, ok := wholeCallReaders[f.agent]; ok {
+		st, readOK := read(f)
+		if !readOK && old != nil {
+			return old // not readable now: what was read before
+		}
+		if readOK {
+			st.Size, st.Mod = f.size, f.mod.UnixNano()
+			writeCalls(st, 0, false)
+		}
+		callsMu.Lock()
+		if readOK && generation == callGeneration {
+			keepCalls(f.path, st)
+		}
+		callsMu.Unlock()
+		return st
 	}
 	st := prepareCalls(f, old)
 	continued := old != nil && st.Off == old.Off && st.Off > 0
@@ -158,6 +261,12 @@ func readCalls(f file) *callFile {
 		st.ContentHash = prefixHash(f.path, f.size)
 		writeCalls(st, start, continued)
 	}
+	// Do not turn a one-time historical scan into an indefinitely retained
+	// window. Previously retained windows may survive idle time in spare slots.
+	if st.Claude != nil && (old == nil || old.Claude == nil) && !workingRevision(f.mod.UnixNano(), time.Now()) {
+		st = st.withoutRevisions()
+	}
+
 	st.dirty = nil
 	callsMu.Lock()
 	if generation == callGeneration {
@@ -171,17 +280,41 @@ func readCalls(f file) *callFile {
 type callPatch struct {
 	Index int
 	Call  Call
-	Text  [12]uint32
+	Text  [13]uint32
 	Began time.Time
 }
 type callFrame struct {
-	State   callFile
+	State   callDiskState
 	Strings []string
 	Patches []callPatch
 }
 
-func callText(c *Call) [12]*string {
-	return [12]*string{&c.Agent, &c.Session, &c.Model, &c.Requested, &c.Effort, &c.Cwd, &c.Upstream, &c.AccountID, &c.UserID, &c.Error, &c.ErrorText, &c.File}
+// Disk state contains only scalar continuation metadata. Even a nil runtime
+// index makes gob emit its recursive type descriptors in every append frame.
+// Keep those types entirely outside the wire schema.
+type callDiskState struct {
+	ContentHash        string
+	Size, Mod, Off     int64
+	Head               string
+	HeadSize           int
+	Path, Agent        string
+	At, End, AsstEnd   int64
+	Session, Requested string
+	LastUser, LastAsst time.Time
+}
+
+func diskCallState(s *callFile) callDiskState {
+	return callDiskState{s.ContentHash, s.Size, s.Mod, s.Off, s.Head, s.HeadSize,
+		s.Path, s.Agent, s.At, s.End, s.AsstEnd, s.Session, s.Requested, s.LastUser, s.LastAsst}
+}
+func (s callDiskState) restore() *callFile {
+	return &callFile{ContentHash: s.ContentHash, Size: s.Size, Mod: s.Mod, Off: s.Off,
+		Head: s.Head, HeadSize: s.HeadSize, Path: s.Path, Agent: s.Agent, At: s.At, End: s.End,
+		AsstEnd: s.AsstEnd, Session: s.Session, Requested: s.Requested, LastUser: s.LastUser, LastAsst: s.LastAsst}
+}
+
+func callText(c *Call) [13]*string {
+	return [13]*string{&c.Agent, &c.Session, &c.ThreadID, &c.Model, &c.Requested, &c.Effort, &c.Cwd, &c.Upstream, &c.AccountID, &c.UserID, &c.Error, &c.ErrorText, &c.File}
 }
 
 func loadCalls(f file) *callFile {
@@ -241,7 +374,7 @@ func loadCalls(f file) *callFile {
 				}
 			}
 		}
-		st = &frame.State
+		st = frame.State.restore()
 	}
 	if st == nil {
 		return nil
@@ -251,11 +384,7 @@ func loadCalls(f file) *callFile {
 }
 
 func writeCalls(st *callFile, start int, appendOnly bool) {
-	frame := callFrame{State: *st, Strings: []string{""}}
-	frame.State.Calls = nil
-	frame.State.Msgs = nil
-	frame.State.Began = nil
-	frame.State.Strs = nil
+	frame := callFrame{State: diskCallState(st), Strings: []string{""}}
 	dict := map[string]uint32{"": 0}
 	add := func(i int) {
 		p := callPatch{Index: i, Call: st.Calls[i], Began: st.Began[st.Calls[i].Msg]}

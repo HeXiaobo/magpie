@@ -4,14 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -101,18 +102,20 @@ func TestArchiveOn(t *testing.T) {
 	b := &memBucket{objs: map[string][]byte{}}
 	archiveTo(t, b)
 	s := New()
-	before := time.Now().UTC()
 	rec := archivePost(t, s)
 	id := rec.Header().Get(ArchiveHeader)
 	if !regexp.MustCompile(`^\d{6}-[0-9a-f]{16}$`).MatchString(id) {
 		t.Fatalf("id %q", id)
 	}
-	name := before.Format("2006-01-02") + "/" + id
+	// the date is the one the call carries, in UTC, not the clock read
+	// again here, which a UTC midnight can fall between
 	c := s.Recent()[0]
+	date := c.Time.UTC().Format("2006-01-02")
+	name := date + "/" + id
 	if c.Archive != name || c.wire != nil {
 		t.Fatalf("call archive %q, want %q", c.Archive, name)
 	}
-	if p, ok := ArchiveName(before.Format("2006-01-02"), id); !ok || p != "archive/"+name+".json" {
+	if p, ok := ArchiveName(date, id); !ok || p != "archive/"+name+".json" {
 		t.Fatalf("ArchiveName %q %v", p, ok)
 	}
 	data, ok := b.objs["archive/"+name+".json"]
@@ -161,6 +164,119 @@ func TestArchiveName(t *testing.T) {
 		if n, ok := ArchiveName(c[0], c[1]); ok {
 			t.Errorf("%v named %q", c, n)
 		}
+	}
+}
+
+// longVendor answers with a reply far longer than the 256 KB Recent calls
+// keeps, ending in RES-TAIL: one JSON body, or, asked to stream, a stream
+// of many small events.
+type longVendor struct{}
+
+func (longVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b, _ := io.ReadAll(r.Body)
+	// Words that don't repeat: the same few words over and over with no
+	// break is a loop the loop guard ends (#1489).
+	var sb strings.Builder
+	for i := 0; sb.Len() < 450_000; i++ {
+		fmt.Fprintf(&sb, "word%d ", i)
+	}
+	words := sb.String() // 450 KB
+	if !strings.Contains(string(b), `"stream":true`) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"c1","object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"`+words+`RES-TAIL"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	for i := range 1000 {
+		io.WriteString(w, `data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"content":"`+words[i*450:(i+1)*450]+`"}}]}`+"\n\n")
+	}
+	io.WriteString(w, `data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"content":"RES-TAIL"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`+"\n\ndata: [DONE]\n\n")
+}
+
+// The archive keeps each body whole, not the first 256 KB Recent calls
+// shows, a stream's too (#447): its files are gone once it is uploaded,
+// and the call's row in the usage log names where it is kept.
+func TestArchiveWholeBodies(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint("stream=", stream), func(t *testing.T) {
+			fresh(t)
+			tmp := t.TempDir()
+			t.Setenv("TMPDIR", tmp)
+			serveOn(t, "fake", "k", []string{"m1"}, longVendor{})
+			settings.Save(settings.Settings{RequestArchive: true})
+			b := &memBucket{objs: map[string][]byte{}}
+			archiveTo(t, b)
+			s := New()
+			body := `{"model":"fake/m1","stream":` + fmt.Sprint(stream) + `,"messages":[{"role":"user","content":"` + strings.Repeat("sit amet ", 40000) + `REQ-TAIL"}]}`
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+			archivePending.Wait()
+			if rec.Code != 200 || !strings.Contains(rec.Body.String(), "RES-TAIL") {
+				t.Fatalf("%d %.300s", rec.Code, rec.Body)
+			}
+			c := s.Recent()[0]
+			if !c.RequestTruncated || !c.ResponseTruncated || len(c.RequestBody) != callBodyLimit {
+				t.Errorf("Recent calls keeps %d, cut %v %v", len(c.RequestBody), c.RequestTruncated, c.ResponseTruncated)
+			}
+			data := b.objs["archive/"+c.Archive+".json"]
+			var a Archived
+			if err := json.Unmarshal(data, &a); err != nil {
+				t.Fatalf("%v: %v", keys(b.objs), err)
+			}
+			if a.Request.Body != body || a.Request.Size != int64(len(body)) || a.Request.Truncated {
+				t.Errorf("request kept %d of %d, size %d, cut %v", len(a.Request.Body), len(body), a.Request.Size, a.Request.Truncated)
+			}
+			if a.Response.Body != rec.Body.String() || a.Response.Size != int64(rec.Body.Len()) || a.Response.Truncated {
+				t.Errorf("response kept %d of %d, size %d, cut %v", len(a.Response.Body), rec.Body.Len(), a.Response.Size, a.Response.Truncated)
+			}
+			if u := lastUsage(t); u.Archive == "" || u.Archive != c.Archive {
+				t.Errorf("usage row names archive %q, the call %q", u.Archive, c.Archive)
+			}
+			// the Routing page's request names it too, for its bodies to be
+			// read back once the recent calls have let them go
+			if rts := s.Trace(context.Background(), 0, 0).Routes; len(rts) != 1 || rts[0].Archive != c.Archive || c.Route != rts[0].ID {
+				t.Errorf("route names archive %q (call %q, route %d of %d)", rts[0].Archive, c.Archive, c.Route, rts[0].ID)
+			}
+			if left, _ := os.ReadDir(tmp); len(left) != 0 {
+				t.Errorf("files left behind: %v", left)
+			}
+		})
+	}
+}
+
+// Past RequestArchiveMaxMB a body is cut, said so, and its whole size kept.
+func TestArchiveLimit(t *testing.T) {
+	fresh(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	serveOn(t, "fake", "k", []string{"m1"}, archiveVendor{})
+	settings.Save(settings.Settings{RequestArchive: true, RequestArchiveMaxMB: 1})
+	b := &memBucket{objs: map[string][]byte{}}
+	archiveTo(t, b)
+	s := New()
+	body := `{"model":"fake/m1","messages":[{"role":"user","content":"` + strings.Repeat("sit amet ", 150000) + `"}]}`
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	archivePending.Wait()
+	var a Archived
+	if err := json.Unmarshal(b.objs["archive/"+s.Recent()[0].Archive+".json"], &a); err != nil {
+		t.Fatal(err)
+	}
+	if !a.Request.Truncated || a.Request.Size != int64(len(body)) || a.Request.Body != body[:1<<20] {
+		t.Errorf("kept %d of %d, size %d, cut %v", len(a.Request.Body), len(body), a.Request.Size, a.Request.Truncated)
+	}
+	if a.Response.Truncated || !strings.Contains(a.Response.Body, `"content":"done"`) {
+		t.Errorf("response %+v", a.Response)
+	}
+}
+
+// A call with the archive off names no archive in the usage log.
+func TestArchiveOffUsage(t *testing.T) {
+	fresh(t)
+	serveOn(t, "fake", "k", []string{"m1"}, archiveVendor{})
+	archiveTo(t, &memBucket{objs: map[string][]byte{}})
+	archivePost(t, New())
+	if u := lastUsage(t); u.Archive != "" {
+		t.Errorf("archive %q while off", u.Archive)
 	}
 }
 

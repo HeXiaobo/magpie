@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+
+	"github.com/yetone/magpie/internal/agentenv"
 )
 
 // A Command Code key's plan and balance, read once, still show when
@@ -22,7 +24,7 @@ func TestKeyQuotasKeepLast(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
 	t.Setenv("PATH", h)
-	for _, v := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME"} {
+	for _, v := range agentenv.Vars {
 		t.Setenv(v, "")
 	}
 	restart := func() {
@@ -36,6 +38,10 @@ func TestKeyQuotasKeepLast(t *testing.T) {
 	t.Cleanup(restart)
 	var down atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Host")+r.URL.Path == "api.commandcode.ai/alpha/billing/subscriptions" {
+			w.WriteHeader(http.StatusServiceUnavailable) // the plan not known: its windows alone
+			return
+		}
 		if r.Header.Get("X-Host")+r.URL.Path != "api.commandcode.ai/alpha/billing/credits" {
 			t.Errorf("asked %s%s", r.Header.Get("X-Host"), r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)

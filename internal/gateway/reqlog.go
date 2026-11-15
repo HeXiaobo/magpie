@@ -34,10 +34,11 @@ func requestID(h http.Header) string {
 	return ""
 }
 
-// endpointOf is the path a call came in on, and the one it went out on when
-// that is another protocol's, as the vendors' own docs write them (the
-// vendor's base URL, which decides the rest, isn't part of it).
-func endpointOf(r *http.Request, from, to provider.Protocol) string {
+// endpointOf is the path a call came in on, and the one it went out on to
+// model at p when that is another protocol's, as the vendors' own docs
+// write them (the vendor's base URL, which decides the rest, isn't part of
+// it).
+func endpointOf(r *http.Request, from, to provider.Protocol, p provider.Provider, model string) string {
 	ep := r.URL.Path
 	if to != "" && to != from {
 		switch to {
@@ -48,7 +49,10 @@ func endpointOf(r *http.Request, from, to provider.Protocol) string {
 		case provider.Anthropic:
 			ep += " → /v1/messages"
 		default:
-			ep += " → " + pathOf(to)
+			if p.IsVertex() { // its path names the model as Vertex AI was asked for it
+				model = provider.UpstreamNameIn(wiresOf(r.Context()), p.ID, model)
+			}
+			ep += " → " + upstreamPath(p, to, model)
 		}
 	}
 	return ep
@@ -56,7 +60,7 @@ func endpointOf(r *http.Request, from, to provider.Protocol) string {
 
 // failedWith fills in what a call that failed said, on a usage record.
 func failedWith(rec *usage.Record, status int, msg, errType string) {
-	if status >= 400 {
+	if status >= 400 || msg != "" {
 		rec.Error, rec.ErrType = keepMsg(msg), errType
 	}
 }

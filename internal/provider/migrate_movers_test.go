@@ -2,6 +2,8 @@ package provider
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -97,6 +99,39 @@ func TestQoderMover(t *testing.T) {
 	})
 }
 
+// A Qoder account still in the single-account qoder.json of before
+// logins.json moves too: the move reads it into logins.json first, with a
+// machine id of its own, and the old file is gone.
+func TestQoderLegacyFileMoves(t *testing.T) {
+	claudeHome(t)
+	legacy := filepath.Join(filepath.Dir(Path()), "qoder.json")
+	writeFile(t, legacy, qoder.Credential{UID: "u1", Email: "one@q.com", Token: "t1", RefreshToken: "r1"})
+	accts, err := movers["qoder"].out()
+	if err != nil || len(accts) != 1 || accts[0].User != "one@q.com" || !accts[0].First || accts[0].Auth["machineId"] == "" {
+		t.Fatalf("the legacy account didn't move: %+v %v", accts, err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("qoder.json is still there: %v", err)
+	}
+}
+
+// A Qoder CN account keeps its site, and one that chats on its device
+// token keeps doing so.
+func TestQoderCNMover(t *testing.T) {
+	c1 := qoder.Credential{Site: QoderCNID, UID: "u1", Email: "a@q.cn", Token: "d1", RefreshToken: "dr1", DeviceToken: "d1", DeviceRefresh: "dr1", DeviceChat: true, ExpiresAt: 1_900_000_000_123, MachineID: "m1"}
+	c2 := qoder.Credential{Site: QoderCNID, UID: "u2", Token: "t2", RefreshToken: "r2", DeviceToken: "d2", ExpiresAt: 1_900_000_000_456, MachineID: "m2"}
+	roundTrip(t, QoderCNID, []savedLogin{
+		{Agent: QoderCNID, User: "a@q.cn", First: true, On: true, Auth: authOf(t, c1)},
+		{Agent: QoderCNID, User: "u2", Auth: authOf(t, c2)},
+	}, func(t *testing.T, a, b savedLogin) {
+		ca, _ := qoderSaved(a)
+		cb, _ := qoderSaved(b)
+		if !reflect.DeepEqual(ca, cb) {
+			t.Fatalf("qoder-cn %s: %+v, want %+v", a.User, cb, ca)
+		}
+	})
+}
+
 func TestFactoryMover(t *testing.T) {
 	c1 := factoryCreds{Access: "a1", Refresh: "r1", ExpiresAt: 1_900_000_000_000, Org: "org_1", Active: "fo1", Email: "a@f.com", UserID: "user_1", Region: "eu", Prem: "llm.example.com"}
 	c2 := factoryCreds{Access: "a2", Refresh: "r2", ExpiresAt: 1_900_000_000_001, UserID: "user_2"}
@@ -110,6 +145,43 @@ func TestFactoryMover(t *testing.T) {
 			t.Fatalf("factory %s: %+v, want %+v", a.User, cb, ca)
 		}
 	})
+}
+
+// A Factory account added by its API key (fk-…) moves as the plugin's own
+// "Factory API key" sign-in saves one, an api account with its key and
+// whoami's metadata (keyAccount in its index.mjs), not as a sign-in the
+// plugin would try to renew with no refresh token; and comes back a key.
+func TestFactoryKeyMover(t *testing.T) {
+	k := factoryCreds{Access: "fk-key_0123456789abcdef", Key: true, Email: "k@f.com", UserID: "user_k", Region: "eu", Prem: "llm.example.com"}
+	c := factoryCreds{Access: "a1", Refresh: "r1", ExpiresAt: 1_900_000_000_000, Email: "a@f.com"}
+	saved := []savedLogin{
+		{Agent: "factory", User: "k@f.com", First: true, Auth: authOf(t, k)},
+		{Agent: "factory", User: "a@f.com", On: true, Auth: authOf(t, c)},
+	}
+	roundTrip(t, "factory", saved, func(t *testing.T, a, b savedLogin) {
+		ca, _ := factorySaved(a)
+		cb, _ := factorySaved(b)
+		if ca != cb {
+			t.Fatalf("factory %s: %+v, want %+v", a.User, cb, ca)
+		}
+	})
+	loginsMu.Lock()
+	if err := writeLogins(slicesClone(saved)); err != nil {
+		t.Fatal(err)
+	}
+	loginsMu.Unlock()
+	accts, err := movers["factory"].out()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"type": "api", "key": k.Access, "metadata": map[string]any{
+		"email": "k@f.com", "userId": "user_k", "region": "eu", "premBaseHost": "llm.example.com"}}
+	if !reflect.DeepEqual(accts[0].Auth, want) {
+		t.Fatalf("the key account moves as %v, want %v", accts[0].Auth, want)
+	}
+	if accts[1].Auth["type"] != "oauth" {
+		t.Fatalf("a signed-in account moves as %v", accts[1].Auth)
+	}
 }
 
 func TestMiMoMover(t *testing.T) {

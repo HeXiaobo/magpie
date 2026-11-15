@@ -11,11 +11,13 @@ import (
 )
 
 // A session's Grok model named at an effort is priced as its model; one no
-// catalog lists (Grok Build's grok-4.7-build, grok-4.7-mini, a fast one)
-// stays unpriced (#224).
+// catalog lists (Grok Build's grok-4.7-build, grok-4.7-mini, Cursor's fast
+// one) stays unpriced (#224). Grok Build's own fast variant,
+// grok-4.7-build-fast, is twice grok-4.7, as xAI sells it.
 func TestPriceOfGrokEffort(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
@@ -28,7 +30,12 @@ func TestPriceOfGrokEffort(t *testing.T) {
 			t.Errorf("priceOf(%q) = %+v, %v; want $2/$6/$0.5", m, pr, ok)
 		}
 	}
-	for _, m := range []string{"grok-4.7-build", "grok-4.7-mini", "grok-4.7-low-fast", "grok-4.7-build-fast"} {
+	for _, m := range []string{"grok-4.7-build-fast", "Grok-4.7-Build-Fast", "grok-4.7-build-fast@500k"} {
+		if pr, ok := priceOf(settings.Load(), m); !ok || pr.Input != 4 || pr.Output != 12 || pr.CacheRead != 1 {
+			t.Errorf("priceOf(%q) = %+v, %v; want twice grok-4.7's, $4/$12/$1", m, pr, ok)
+		}
+	}
+	for _, m := range []string{"grok-4.7-build", "grok-4.7-mini", "grok-4.7-low-fast", "grok-4.6-build-fast"} {
 		if pr, ok := priceOf(settings.Load(), m); ok {
 			t.Errorf("priceOf(%q) = %+v; want unpriced", m, pr)
 		}
@@ -41,6 +48,7 @@ func TestPriceOfGrokEffort(t *testing.T) {
 func TestPriceOfStatedProviderPrice(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
@@ -83,6 +91,7 @@ func TestPriceOfStatedProviderPrice(t *testing.T) {
 func TestPriceOfAfterProviderRename(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
@@ -123,6 +132,7 @@ func TestPriceOfAfterProviderRename(t *testing.T) {
 func TestListingPricesEveryModelAtTheSettingsItReadOnce(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	catalog.Reset()

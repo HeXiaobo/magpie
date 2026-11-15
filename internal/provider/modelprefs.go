@@ -1,8 +1,10 @@
 package provider
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -62,21 +64,33 @@ func splitRef(ref string) (*Provider, string, error) {
 // their own are told (catalog.Touched), as for any other change of the
 // catalog.
 func SetModelName(ref, name string) error {
+	return touchedIf(setModelName(ref, name))
+}
+
+// touchedIf tells the agents of a change to the catalog that was made.
+func touchedIf(changed bool, err error) error {
+	if changed {
+		catalog.Touched()
+	}
+	return err
+}
+
+func setModelName(ref, name string) (bool, error) {
 	p, model, err := splitRef(ref)
 	if err != nil {
-		return err
+		return false, err
 	}
 	name = strings.Join(strings.Fields(name), " ")
 	if len([]rune(name)) > 80 {
-		return errors.New("a model's name is at most 80 characters")
+		return false, errors.New("a model's name is at most 80 characters")
 	}
 	if name != "" && !p.serves(model) {
-		return fmt.Errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
+		return false, fmt.Errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
 	}
 	s := settings.Load()
 	key := p.ID + "/" + model
 	if s.ModelNames[key] == name {
-		return nil
+		return false, nil
 	}
 	if name == "" {
 		delete(s.ModelNames, key)
@@ -87,10 +101,9 @@ func SetModelName(ref, name string) error {
 		s.ModelNames[key] = name
 	}
 	if err := settings.Save(s); err != nil {
-		return err
+		return false, err
 	}
-	catalog.Touched()
-	return nil
+	return true, nil
 }
 
 // SetModelPrice is what a provider's model costs the user, in USD per million
@@ -132,10 +145,7 @@ func SetModelPrice(id string, p *catalog.Price) error {
 		key = pr.ID + "/" + model
 	}
 	s := settings.Load()
-	m := settings.ModelPrice{
-		Input: new(p.Input), Output: new(p.Output),
-		CacheRead: new(p.CacheRead), CacheWrite: new(p.CacheWrite),
-	}
+	m := settings.StatedPrice(*p)
 	if err := settings.CheckModelPrice(key, m); err != nil {
 		return err
 	}
@@ -229,9 +239,13 @@ var Levels = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"
 // levels aren't known, any of Levels, which it is given; none takes them
 // away.
 func SetModelEfforts(ref string, efforts []string) error {
+	return touchedIf(setModelEfforts(ref, efforts))
+}
+
+func setModelEfforts(ref string, efforts []string) (bool, error) {
 	p, model, err := splitRef(ref)
 	if err != nil {
-		return err
+		return false, err
 	}
 	all := p.Known(model)
 	var keep []string
@@ -241,10 +255,10 @@ func SetModelEfforts(ref string, efforts []string) error {
 			continue
 		}
 		if len(all) == 0 && !slices.Contains(Levels, e) {
-			return fmt.Errorf("%q is not a reasoning level (they are %s)", e, strings.Join(Levels, ", "))
+			return false, fmt.Errorf("%q is not a reasoning level (they are %s)", e, strings.Join(Levels, ", "))
 		}
 		if len(all) > 0 && !slices.Contains(all, e) {
-			return fmt.Errorf("%s/%s has no reasoning level %q (it has %s)", p.ID, model, e, strings.Join(all, ", "))
+			return false, fmt.Errorf("%s/%s has no reasoning level %q (it has %s)", p.ID, model, e, strings.Join(all, ", "))
 		}
 		if !slices.Contains(keep, e) {
 			keep = append(keep, e)
@@ -256,8 +270,12 @@ func SetModelEfforts(ref string, efforts []string) error {
 	}
 	s := settings.Load()
 	key := p.ID + "/" + model
-	if slices.Equal(s.ModelEfforts[key], keep) {
-		return nil
+	// levels given, or all of them again, take back a word that it takes
+	// no reasoning ask (SetModelReasonless)
+	reasonless := s.ModelReasonless[key]
+	delete(s.ModelReasonless, key)
+	if slices.Equal(s.ModelEfforts[key], keep) && !reasonless {
+		return false, nil
 	}
 	if len(keep) == 0 {
 		delete(s.ModelEfforts, key)
@@ -268,10 +286,53 @@ func SetModelEfforts(ref string, efforts []string) error {
 		s.ModelEfforts[key] = keep
 	}
 	if err := settings.Save(s); err != nil {
-		return err
+		return false, err
 	}
-	catalog.Touched()
-	return nil
+	return true, nil
+}
+
+// SetModelReasonless says whether a provider's model, spelt
+// "provider/model", takes no reasoning ask, whatever its list says: on,
+// it offers no levels (Efforts, the agents' lists, a group's) and the
+// gateway sends it no reasoning field on any API — Chat's
+// reasoning_effort, Responses' reasoning, Anthropic's thinking and
+// output_config effort — as it does a model known not to think
+// (yuexian7 on Discord: models.dev lists a model with reasoning, and the
+// vendor answers reasoning_effort with 422 while the request without it
+// works). Off gives it the levels it had again.
+func SetModelReasonless(ref string, on bool) error {
+	return touchedIf(setModelReasonless(ref, on))
+}
+
+func setModelReasonless(ref string, on bool) (bool, error) {
+	p, model, err := splitRef(ref)
+	if err != nil {
+		return false, err
+	}
+	s := settings.Load()
+	key := p.ID + "/" + model
+	if s.ModelReasonless[key] == on {
+		return false, nil
+	}
+	if on {
+		if s.ModelReasonless == nil {
+			s.ModelReasonless = map[string]bool{}
+		}
+		s.ModelReasonless[key] = true
+		delete(s.ModelEfforts, key) // none kept of none offered
+	} else {
+		delete(s.ModelReasonless, key)
+	}
+	if err := settings.Save(s); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Reasonless reports whether the user said pid's model takes no reasoning
+// ask (SetModelReasonless).
+func Reasonless(pid, model string) bool {
+	return heldSettings().ModelReasonless[pid+"/"+model]
 }
 
 // ModelEfforts are the reasoning levels the user kept of the provider's
@@ -307,12 +368,16 @@ func effortsKept(all, kept []string) []string {
 // SetModelImage says whether a provider's model takes images, in place
 // of what its vendor's list says. nil gives that answer back.
 func SetModelImage(ref string, images *bool) error {
+	return touchedIf(setModelImage(ref, images))
+}
+
+func setModelImage(ref string, images *bool) (bool, error) {
 	p, model, err := splitRef(ref)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if images != nil && !p.serves(model) {
-		return fmt.Errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
+		return false, fmt.Errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
 	}
 	if images != nil {
 		if vendor, known := vendorSees(p, model); known && *images == vendor {
@@ -323,12 +388,12 @@ func SetModelImage(ref string, images *bool) error {
 	key := p.ID + "/" + model
 	if images == nil {
 		if _, ok := s.ModelImages[key]; !ok {
-			return nil
+			return false, nil
 		}
 		delete(s.ModelImages, key)
 	} else {
 		if cur, ok := s.ModelImages[key]; ok && cur == *images {
-			return nil
+			return false, nil
 		}
 		if s.ModelImages == nil {
 			s.ModelImages = map[string]bool{}
@@ -336,15 +401,233 @@ func SetModelImage(ref string, images *bool) error {
 		s.ModelImages[key] = *images
 	}
 	if err := settings.Save(s); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// SetModelAPI says which one of a provider's APIs a model is asked on —
+// chat, responses, anthropic or gemini — for a relay whose one key serves some of
+// its models on one and others on another (01huadalang on Discord: 有的供应商
+// 一个 api 里有很多模型但是不同协议); "" leaves it to the vendor's list and
+// the URLs the provider has, as before. It must be an API the provider has
+// a URL for: a preset's or a subscription's as well as a custom
+// provider's, when it has more than one (01huadalang: OpenCode Go's
+// deepseek-v4.1-flash answers on Responses too, and magpie asked it on
+// chat alone).
+func SetModelAPI(ref, api string) error {
+	return touchedIf(setModelAPI(ref, api))
+}
+
+func setModelAPI(ref, api string) (bool, error) {
+	p, model, err := splitRef(ref)
+	if err != nil {
+		return false, err
+	}
+	proto := Protocol(strings.TrimSpace(api))
+	if proto != "" {
+		if !modelAPI(proto) {
+			return false, fmt.Errorf("a model's API is chat, responses, anthropic or gemini, not %q", api)
+		}
+		if p.Base(proto) == "" {
+			return false, fmt.Errorf("%s has no %s URL to ask %s on: add it under More endpoints first", p.ID, proto, model)
+		}
+		if !p.serves(model) {
+			return false, fmt.Errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
+		}
+	}
+	s := settings.Load()
+	key := p.ID + "/" + model
+	if s.ModelAPIs[key] == string(proto) {
+		return false, nil
+	}
+	if proto == "" {
+		delete(s.ModelAPIs, key)
+	} else {
+		if s.ModelAPIs == nil {
+			s.ModelAPIs = map[string]string{}
+		}
+		s.ModelAPIs[key] = string(proto)
+	}
+	if err := settings.Save(s); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ModelAPI is the API the user said p's model is asked on, when p has a
+// URL for it still.
+func (p Provider) ModelAPI(model string) (Protocol, bool) {
+	if len(p.Speaks()) < 2 {
+		return "", false
+	}
+	proto := Protocol(heldSettings().ModelAPIs[p.ID+"/"+model])
+	if proto == "" || !modelAPI(proto) || p.Base(proto) == "" {
+		return "", false
+	}
+	return proto, true
+}
+
+// modelAPI is whether proto is one a model can be set to be asked on: the
+// three magpie translates between, and a Gemini URL's generateContent
+// (Kayphoon on Discord: a custom provider's Gemini format, which a model's
+// own choice didn't offer)
+func modelAPI(proto Protocol) bool {
+	return slices.Contains(Protocols, proto) || proto == Gemini
+}
+
+// ModelPref is what the provider editor's Names & levels changed of one
+// model, sent with its Save: each part left nil is as it was. Name "" gives
+// the model its own name back, Efforts [] all its levels, OwnImages the
+// vendor's answer for whether it sees images, API "" every API the
+// provider has for it, Same "" its own id to merge it with other
+// vendors' by (see setModelSame), OwnPrice its list price again in
+// place of Price, what the user said it costs (SetModelPrice, #819), and
+// Kind "" what its vendor's list says it makes (SetModelKind, #1399).
+type ModelPref struct {
+	Name    *string   `json:"name,omitempty"`
+	Efforts *[]string `json:"efforts,omitempty"`
+	// Reasonless, set, is SetModelReasonless's word: true for no
+	// reasoning ask, false to take that back
+	Reasonless *bool          `json:"reasonless,omitempty"`
+	Images     *bool          `json:"images,omitempty"`
+	OwnImages  bool           `json:"ownImages,omitempty"`
+	API        *string        `json:"api,omitempty"`
+	Same       *string        `json:"same,omitempty"`
+	Price      *catalog.Price `json:"price,omitempty"`
+	OwnPrice   bool           `json:"ownPrice,omitempty"`
+	// Kind is what the model makes, as SetModelKind takes it: "image",
+	// "video", or "" for what its vendor's list and name say (#1399)
+	Kind *string `json:"kind,omitempty"`
+}
+
+// SetModelPrefs makes the changes to a provider's models, by model id, as
+// SetModelName, SetModelEfforts, SetModelImage, SetModelAPI and
+// setModelSame do, and tells the agents
+// once, after them all, rather than once a change. It stops at the first
+// that fails, telling the agents of those made before it.
+func SetModelPrefs(pid string, prefs map[string]ModelPref) error {
+	changed := false
+	set := func(c bool, err error) error {
+		changed = changed || c
 		return err
 	}
-	catalog.Touched()
-	return nil
+	err := func() error {
+		for _, model := range slices.Sorted(maps.Keys(prefs)) {
+			m, ref := prefs[model], pid+"/"+model
+			if m.Name != nil {
+				if err := set(setModelName(ref, *m.Name)); err != nil {
+					return err
+				}
+			}
+			if m.Efforts != nil {
+				if err := set(setModelEfforts(ref, *m.Efforts)); err != nil {
+					return err
+				}
+			}
+			if m.Reasonless != nil {
+				if err := set(setModelReasonless(ref, *m.Reasonless)); err != nil {
+					return err
+				}
+			}
+			if m.Images != nil || m.OwnImages {
+				images := m.Images
+				if m.OwnImages {
+					images = nil
+				}
+				if err := set(setModelImage(ref, images)); err != nil {
+					return err
+				}
+			}
+			if m.API != nil {
+				if err := set(setModelAPI(ref, *m.API)); err != nil {
+					return err
+				}
+			}
+			if m.Same != nil {
+				if err := set(setModelSame(ref, *m.Same)); err != nil {
+					return err
+				}
+			}
+			// nor is what a model makes: its chat list stays as it was,
+			// and the gateway reads it for each request (#1399)
+			if m.Kind != nil {
+				if _, err := setModelKind(ref, *m.Kind); err != nil {
+					return err
+				}
+			}
+			// a price isn't what an agent picks a model by: the agents
+			// aren't told of it
+			if m.Price != nil || m.OwnPrice {
+				price := m.Price
+				if m.OwnPrice {
+					price = nil
+				}
+				if err := SetModelPrice(ref, price); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}()
+	return touchedIf(changed, err)
+}
+
+// setModelSame says which model a provider's model, spelt "provider/model",
+// is the same as, for one a vendor names its own way (Volcengine Ark's
+// dated ids, kyzhouxu on #583): the routing groups magpie finds merge it
+// with that model from every other provider (autoGroups), and a call to
+// it no list prices is costed at that model's maker's price (SamePriceIn,
+// #2344). The name is a
+// model's id as any vendor spells it ("deepseek-v4.1-flash", or with a
+// vendor's prefix); "" — or a name that is the model's own however spelt —
+// merges it by its own id again.
+func setModelSame(ref, same string) (bool, error) {
+	p, model, err := splitRef(ref)
+	if err != nil {
+		return false, err
+	}
+	same = strings.TrimSpace(same)
+	if len([]rune(same)) > 80 {
+		return false, errors.New("the model a model is the same as is at most 80 characters")
+	}
+	if same != "" && Slug(sameModel(same)) == "" {
+		return false, fmt.Errorf("%q names no model: give a model's id, as deepseek-v4.1-flash", same)
+	}
+	if sameModel(same) == sameModel(model) {
+		same = "" // its own id: merged by it already
+	}
+	if same != "" && !p.serves(model) {
+		return false, fmt.Errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
+	}
+	s := settings.Load()
+	key := p.ID + "/" + model
+	if s.ModelSameAs[key] == same {
+		return false, nil
+	}
+	if same == "" {
+		delete(s.ModelSameAs, key)
+	} else {
+		if s.ModelSameAs == nil {
+			s.ModelSameAs = map[string]string{}
+		}
+		s.ModelSameAs[key] = same
+	}
+	if err := settings.Save(s); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ImageOverride is the user's answer for whether pid's model takes images.
 func ImageOverride(pid, model string) (bool, bool) {
-	v, ok := settings.Load().ModelImages[pid+"/"+model]
+	return ImageOverrideIn(settings.Load(), pid, model)
+}
+
+// ImageOverrideIn is ImageOverride from settings s already read: a list of
+// many models reads them once, not for each (lml on Discord, Windows).
+func ImageOverrideIn(s settings.Settings, pid, model string) (bool, bool) {
+	v, ok := s.ModelImages[pid+"/"+model]
 	return v, ok
 }
 
@@ -384,11 +667,15 @@ func renameModelPrefs(s *settings.Settings, from, to string) bool {
 	// the models a user has hidden from a picker are keyed by provider as
 	// well, and are not one of the per-model preference maps: they say
 	// which models are shown, not what a model is called or costs
+	// (and so is the order they are listed in, the ones picked for an agent
+	// shown only its picks, and the ones sent fast or Ultrafast)
 	hidden := false
-	for _, ids := range s.HiddenModels {
-		for i, id := range ids {
-			if rest, ok := strings.CutPrefix(id, from+"/"); ok {
-				ids[i], hidden = to+"/"+rest, true
+	for _, m := range []map[string][]string{s.HiddenModels, s.PickedModels, s.OrderedModels, s.FastPicks, s.UltraPicks} {
+		for _, ids := range m {
+			for i, id := range ids {
+				if rest, ok := strings.CutPrefix(id, from+"/"); ok {
+					ids[i], hidden = to+"/"+rest, true
+				}
 			}
 		}
 	}
@@ -414,38 +701,165 @@ func (e Entry) Label() string {
 // when the user wants names plain (settings' PlainNames, #335), by the
 // name alone — but for two or more the list would call the same, as a
 // routing group found for a model is called with that model left in the
-// list, which keep their provider's after it to tell them apart.
+// list, which keep their provider's after it to tell them apart. With
+// their own names plain (PlainOwnNames, #92), a name the user gave — a
+// model's, or a routing group's they made (#868: "· routing group" was
+// what an agent's narrow menu cut off) — is that name just as they wrote
+// it, but for two the list would call the same, and the rest keep Label's.
 func Labels(es []Entry) []string {
 	out := make([]string, len(es))
-	plain := settings.Load().PlainNames
+	s := heldSettings()
+	plain := s.PlainNames
+	own := !plain && s.PlainOwnNames
 	same := map[string]int{}
-	if plain {
+	if plain || own {
 		for _, e := range es {
-			same[strings.ToLower(e.Name)]++
+			same[strings.ToLower(e.PlainName())]++
 		}
 	}
 	for i, e := range es {
 		out[i] = e.Label()
-		if plain && e.Name != "" && same[strings.ToLower(e.Name)] == 1 {
-			out[i] = e.Name
+		mine := own && (e.Default != "" || e.Named)
+		if name := e.PlainName(); (plain || mine) && name != "" && same[strings.ToLower(name)] == 1 {
+			out[i] = name
 		}
 	}
 	return out
 }
 
-// SetPlainNames has the agents' model lists name models by their names
-// alone (see Labels), or with their providers' again, and the agents told.
-func SetPlainNames(on bool) error {
+// PlainName is the entry's name alone: a remote magpie's model's without
+// the provider its list put after it by that magpie's own setting, which
+// this one's Provider in model names Off leaves out as well (ARNO on
+// Discord: "· Relay A" and "· routing group" stayed under Off).
+func (e Entry) PlainName() string { return cmp.Or(e.Plain, e.Name) }
+
+// Thinks is whether the model thinks, as /v1/models says it and every
+// agent's list is told it: a model with levels, or one marked Reasoning
+// with a thinking switch alone. An export that read the levels alone
+// marked Trae CN's kimi-k3-max, which always thinks and has no levels
+// magpie knows, not reasoning for Pi, and `magpie pi effort high` was
+// clamped to off (#2380).
+func (e Entry) Thinks() bool { return e.Reasoning || len(e.Efforts) > 0 }
+
+// The ways the agents' lists name models (SuffixMode): every name with its
+// provider's after it, as by default; all but the names the user gave
+// models (#92); or none (#335).
+const (
+	SuffixOn  = "on"
+	SuffixOwn = "own"
+	SuffixOff = "off"
+)
+
+// SuffixMode is how the agents' lists name models: SuffixOn, SuffixOwn or
+// SuffixOff.
+func SuffixMode() string {
 	s := settings.Load()
-	if s.PlainNames == on {
+	switch {
+	case s.PlainNames:
+		return SuffixOff
+	case s.PlainOwnNames:
+		return SuffixOwn
+	}
+	return SuffixOn
+}
+
+// SetSuffixMode has the agents' model lists name models as mode says (see
+// Labels), and the agents told when it changes.
+func SetSuffixMode(mode string) error {
+	plain, own := false, false
+	switch mode {
+	case SuffixOn:
+	case SuffixOwn:
+		own = true
+	case SuffixOff:
+		plain = true
+	default:
+		return fmt.Errorf("provider in model names: on, own or off, not %q", mode)
+	}
+	s := settings.Load()
+	if s.PlainNames == plain && s.PlainOwnNames == own {
 		return nil
 	}
-	s.PlainNames = on
+	s.PlainNames, s.PlainOwnNames = plain, own
 	if err := settings.Save(s); err != nil {
 		return err
 	}
 	catalog.Touched()
 	return nil
+}
+
+// SetCodexAgentsV1 turns settings.CodexAgentsV1 on or off, and has Codex's
+// lists written and asked for again.
+func SetCodexAgentsV1(on bool) error {
+	s := settings.Load()
+	if s.CodexAgentsV1 == on {
+		return nil
+	}
+	s.CodexAgentsV1 = on
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
+}
+
+// SetCodexAutoReview sets settings.CodexAutoReview, the model Codex's
+// auto-review runs on ("" for Codex's own pick), and has Codex's lists
+// written and asked for again.
+func SetCodexAutoReview(id string) error {
+	s := settings.Load()
+	if s.CodexAutoReview == id {
+		return nil
+	}
+	s.CodexAutoReview = id
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
+}
+
+// SetCodexAsyncCompact sets Codex's background compaction
+// (settings.CodexAsyncCompact) and the share of a model's window it starts
+// at, 1–100 or 0 for Codex's own, and has Codex's config written again.
+func SetCodexAsyncCompact(on bool, percent int) error {
+	if percent < 0 || percent > 100 {
+		return fmt.Errorf("Codex compacts in the background past 1 to 100%% of a model's window, not %d%%", percent)
+	}
+	s := settings.Load()
+	if s.CodexAsyncCompact == on && s.CodexAsyncCompactPercent == percent {
+		return nil
+	}
+	s.CodexAsyncCompact, s.CodexAsyncCompactPercent = on, percent
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
+}
+
+// SetFullContext turns settings.FullContext on or off: Codex and Claude
+// Code are told a model's whole window, or the working one, again.
+func SetFullContext(on bool) error {
+	s := settings.Load()
+	if s.FullContext == on {
+		return nil
+	}
+	s.FullContext = on
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
+}
+
+// SetPlainNames has the agents' model lists name models by their names
+// alone (see Labels), or with their providers' again, and the agents told.
+func SetPlainNames(on bool) error {
+	if on {
+		return SetSuffixMode(SuffixOff)
+	}
+	return SetSuffixMode(SuffixOn)
 }
 
 // ModelNames are the names the user gave the provider's models, by model id.
@@ -851,13 +1265,8 @@ func (p Provider) asksOwnBackend() bool {
 		return false
 	}
 	switch p.Account.Agent {
-	case "claude", "cursor", "devin", "kiro", "zed", CommandCodePlanID:
+	case "claude":
 		return true
 	}
-	// Qoder is one backend however many sites it is signed in to, and the
-	// gateway's dispatch covers the whole family rather than the site the
-	// account was made on, so the family is asked of rather than one id of
-	// it: a name refused for the one subscription has to be refused for
-	// the other too, which is as much magpie's own there.
-	return slices.Contains(qoderAgents, p.Account.Agent)
+	return false
 }

@@ -12,14 +12,19 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 func TestKnownTextOnlyModelRejectsImagesBeforeUpstream(t *testing.T) {
 	fresh(t)
 	noVision(t)
 	var sent int
+	var model string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sent++
+		var req struct{ Model string }
+		json.NewDecoder(r.Body).Decode(&req)
+		model = req.Model
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
 	}))
@@ -47,6 +52,11 @@ func TestKnownTextOnlyModelRejectsImagesBeforeUpstream(t *testing.T) {
 		if rec.Code != 400 || !strings.Contains(rec.Body.String(), "does not support image input") {
 			t.Errorf("%s: %d %s", tc.path, rec.Code, rec.Body.String())
 		}
+		// it says why magpie takes it for text-only, and where that is
+		// changed (KimYx0207 on X)
+		if b := rec.Body.String(); !strings.Contains(b, "Probe's model list marks it as not taking images") || !strings.Contains(b, "Providers → Probe → Names & levels") {
+			t.Errorf("%s: doesn't say why or where: %s", tc.path, b)
+		}
 	}
 	if sent != 0 {
 		t.Fatalf("text-only images reached upstream %d times", sent)
@@ -57,8 +67,10 @@ func TestKnownTextOnlyModelRejectsImagesBeforeUpstream(t *testing.T) {
 	groupBody := strings.Replace(cases[0].body, "probe/text", "group/mixed", 1)
 	group := httptest.NewRecorder()
 	s.Handler().ServeHTTP(group, httptest.NewRequest("POST", cases[0].path, strings.NewReader(groupBody)))
-	if group.Code != 400 || sent != 0 {
-		t.Fatalf("mixed-capability group: %d %s; upstream sent %d", group.Code, group.Body.String(), sent)
+	// a group with a member that sees takes the image, and gives it to
+	// that member, though the text-only one comes first (#756)
+	if group.Code != 200 || sent != 1 || model != "vision" {
+		t.Fatalf("mixed-capability group: %d %s; upstream sent %d, to %q", group.Code, group.Body.String(), sent, model)
 	}
 	code, body := postAs(t, s, "", `{"model":"probe/text","messages":[{"role":"user","content":"the text image_url is not an image"}]}`)
 	if code != 200 {
@@ -72,8 +84,8 @@ func TestKnownTextOnlyModelRejectsImagesBeforeUpstream(t *testing.T) {
 			t.Errorf("%s image: %d %s", model, rec.Code, rec.Body.String())
 		}
 	}
-	if sent != 3 {
-		t.Fatalf("text, vision, and unknown requests sent %d times", sent)
+	if sent != 4 {
+		t.Fatalf("group, text, vision, and unknown requests sent %d times", sent)
 	}
 }
 
@@ -183,8 +195,17 @@ func TestTextOnlyModelOmitsToolImages(t *testing.T) {
 			}
 			rec := httptest.NewRecorder()
 			New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", tc.path, strings.NewReader(tc.body)))
-			if rec.Code != 200 || strings.Contains(sent, "aGVsbG8=") || !strings.Contains(sent, "Image omitted") || !strings.Contains(sent, "call_1") {
+			if rec.Code != 200 || strings.Contains(sent, "aGVsbG8=") || !strings.Contains(sent, "Image omitted") {
 				t.Fatalf("tool image: %d %s; upstream %s", rec.Code, rec.Body.String(), sent)
+			}
+			if tc.name == "responses-to-chat" {
+				// an orphaned tool result reaches a Chat upstream as a
+				// user message: no call pairs with it, no id is made up
+				if strings.Contains(sent, "call_1") || !strings.Contains(sent, "screenshot") {
+					t.Fatalf("orphaned tool result: %s", sent)
+				}
+			} else if !strings.Contains(sent, "call_1") {
+				t.Fatalf("tool result lost its call id: %s", sent)
 			}
 			if tc.endpoint == "responses" {
 				var request struct {
@@ -337,7 +358,7 @@ func TestGroupWithUnknownImageCapabilityReachesUpstream(t *testing.T) {
 	}
 	for _, e := range provider.Catalog() {
 		if e.ID == "group/auto-claude-sonnet-4-5" {
-			if !e.Images || e.ImageInput != nil {
+			if !e.Images || e.ImageInput == nil || !*e.ImageInput {
 				t.Fatalf("group image capability: %+v", e)
 			}
 			return
@@ -464,5 +485,46 @@ func TestGeminiNonImageFileTranslation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A model the user marked text-only themselves is turned away saying so,
+// and a group with no member that takes images says that, each with where
+// it is changed (KimYx0207 on X).
+func TestTextOnlyRefusalSaysWhyAndWhere(t *testing.T) {
+	fresh(t)
+	noVision(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("an image for a text-only model reached upstream: %s", r.URL)
+	}))
+	defer up.Close()
+	if err := provider.Save(provider.Provider{ID: "probe", Name: "Probe", Chat: up.URL + "/v1", Key: "key", Models: []string{"sol", "text"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveLive("probe", up.URL+"/v1", []catalog.Model{
+		{ID: "sol", Images: true, ImageInput: imageInputBool(true)},
+		{ID: "text", ImageInput: imageInputBool(false)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s0 := settings.Load()
+	s0.ModelImages = map[string]bool{"probe/sol": false}
+	if err := settings.Save(s0); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SaveGroup(provider.Group{Name: "Words", Members: []string{"probe/text", "probe/sol"}, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	body := `{"model":"MODEL","messages":[{"role":"user","content":[{"type":"text","text":"read"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]}]}`
+	for model, want := range map[string]string{
+		"probe/sol":   "Accepts images is turned off for it in magpie, in Providers → Probe → Names & levels",
+		"group/words": "no model in the group Words is marked as taking images",
+	} {
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(strings.Replace(body, "MODEL", model, 1))))
+		if rec.Code != 400 || !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("%s: %d %s, want %q", model, rec.Code, rec.Body.String(), want)
+		}
 	}
 }

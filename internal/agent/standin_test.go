@@ -27,6 +27,19 @@ func TestClaudeStandIn(t *testing.T) {
 			t.Errorf("%s: %q, want %q", asked, got, want)
 		}
 	}
+	// every version of a family is its tier's; the main model, named by
+	// its own id, is the main model's
+	write(`{"env":{"ANTHROPIC_BASE_URL":"` + gateway.URL() + `","ANTHROPIC_MODEL":"claude-opus-5[1m]","ANTHROPIC_DEFAULT_OPUS_MODEL":"a/big:high[1m]","ANTHROPIC_DEFAULT_SONNET_MODEL":"a/mid","ANTHROPIC_DEFAULT_FABLE_MODEL":"a/fab[1m]"}}`)
+	for asked, want := range map[string]string{
+		"claude-opus-5":              "claude-opus-5[1m]",
+		"claude-opus-5-5":            "a/big:high[1m]",
+		"claude-sonnet-5-5-20261001": "a/mid",
+		"claude-fable-5-1[1m]":       "a/fab[1m]",
+	} {
+		if got := claudeStandIn(path, asked); got != want {
+			t.Errorf("%s: %q, want %q", asked, got, want)
+		}
+	}
 	// Claude Code on Anthropic's own endpoint: nothing stands in
 	write(`{"env":{"ANTHROPIC_MODEL":"a/main"}}`)
 	if got := claudeStandIn(path, "claude-haiku-4-5"); got != "" {
@@ -59,7 +72,11 @@ func TestCodexStandIn(t *testing.T) {
 		t.Errorf("magpie as provider: %q", got)
 	}
 	// the gateway knows the request as Codex's by its User-Agent
-	for _, ua := range []string{"codex_cli_rs/0.160.0 (Mac OS 26.6.0; arm64) Apple_Terminal/455", "Codex Desktop/0.160.0"} {
+	for _, ua := range []string{
+		"codex_cli_rs/0.160.0 (Mac OS 26.6.0; arm64) Apple_Terminal/455",
+		"Codex Desktop/0.160.0",
+		"acp-extension-codex/0.160.1 (Mac OS 26.2.0; arm64) unknown (acp-extension-codex; 0.9.0)",
+	} {
 		if got := usage.AgentOf(ua); got != "codex" {
 			t.Errorf("%s: agent %q", ua, got)
 		}

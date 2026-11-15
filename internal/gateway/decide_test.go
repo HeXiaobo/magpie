@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +19,54 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 )
+
+func TestMixedDecisionGateway(t *testing.T) {
+	fresh(t)
+	var paths []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/chat/completions":
+			var q struct{ Model string }
+			json.NewDecoder(r.Body).Decode(&q)
+			if q.Model != "deepseek-v4.1-flash" {
+				http.Error(w, "wrong conversation model", 400)
+				return
+			}
+			io.WriteString(w, `{"id":"chat","choices":[{"index":0,"message":{"role":"assistant","content":"2"},"finish_reason":"stop"}]}`)
+		case "/v1/systemone":
+			var q struct{ Model string }
+			json.NewDecoder(r.Body).Decode(&q)
+			if q.Model != "typesafe/jev" {
+				http.Error(w, "wrong decision model", 400)
+				return
+			}
+			io.WriteString(w, `{"model":"typesafe/jev","answers":{"levels":{"type":"noul","noul":0},"intent":{"type":"choice","choice":"bug","confidence":0.9}}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	if err := provider.Save(provider.Provider{ID: "mixed", Name: "Mixed", Key: "k", Chat: up.URL + "/v1", Decide: up.URL + "/v1", Models: []string{"deepseek-v4.1-flash", "typesafe/jev"}}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	if code, body := postAs(t, s, "", `{"model":"mixed/deepseek-v4.1-flash","messages":[{"role":"user","content":"hello"}]}`); code != 200 || !strings.Contains(body, `"content":"2"`) {
+		t.Fatalf("conversation: %d %s", code, body)
+	}
+	if code, _ := postAs(t, s, "", `{"model":"mixed/typesafe/jev","messages":[{"role":"user","content":"hello"}]}`); code != 400 {
+		t.Fatalf("Jev conversation: %d", code)
+	}
+	for _, model := range []string{"mixed/deepseek-v4.1-flash", "mixed/typesafe/jev"} {
+		if v, err := s.askClassifier(model, []string{"feature", "bug"}, before{}, false, "fix this"); err != nil || v.Intent != "bug" {
+			t.Fatalf("classify with %s: %+v %v", model, v, err)
+		}
+	}
+	if strings.Join(paths, ",") != "/v1/chat/completions,/v1/chat/completions,/v1/systemone,/v1/systemone" {
+		t.Fatalf("upstream endpoints: %v", paths)
+	}
+}
 
 // jevUp is a System One API: it answers each question it is asked with
 // what choice and score say, and keeps what it was asked.
@@ -119,7 +169,7 @@ func TestSystemOneRoutesByPrefix(t *testing.T) {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{"model": q.Model, "answers": map[string]any{"intent": map[string]any{"choice": "bug"}}})
+			json.NewEncoder(w).Encode(map[string]any{"model": q.Model, "answers": map[string]any{"intent": map[string]any{"choice": "bug"}}, "usage": map[string]int{"input_tokens": 10, "output_tokens": 2}})
 		}))
 		return srv, &hits, &mu, &status, &ctype, &failBody
 	}
@@ -140,6 +190,7 @@ func TestSystemOneRoutesByPrefix(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", path, strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer magpie")
+		req.Header.Set(SessionHeader, "decision-session")
 		s.Handler().ServeHTTP(rec, req)
 		return rec
 	}
@@ -149,6 +200,9 @@ func TestSystemOneRoutesByPrefix(t *testing.T) {
 	}
 	if n := len(s.trace.routes); n != 1 {
 		t.Fatalf("traced %d", n)
+	}
+	if r := s.trace.routes[0]; r.Session != "decision-session" || len(r.Usage) != 1 || r.Usage[0].Provider != "load-a" || r.Usage[0].Model != "jev-latest" {
+		t.Fatalf("decision accounting: %+v", r)
 	}
 	if recs := usage.Load(time.Time{}); len(recs) != 1 || recs[0].RouteID == 0 || recs[0].RouteID != s.trace.routes[0].ID {
 		t.Fatalf("usage route: %+v", recs)
@@ -290,6 +344,19 @@ func TestJevPicksTheIntent(t *testing.T) {
 	if code, out := postAs(t, s, "s3", `{"model":"ts/jev-latest","messages":[{"role":"user","content":"hi"}]}`); code != 400 || !strings.Contains(out, "only decides") {
 		t.Fatalf("chat to Jev: %d %s", code, out)
 	}
+	// its record is the routing classifier's, magpie's own (#1839)
+	n := 0
+	for _, r := range usage.Load(time.Time{}) {
+		if r.Provider == "ts" {
+			if r.Kind != "routing" || !r.ByMagpie() {
+				t.Fatalf("Jev's record: %+v", r)
+			}
+			n++
+		}
+	}
+	if n < 2 {
+		t.Fatalf("%d records of Jev's, one a turn at least", n)
+	}
 }
 
 // Intents that are levels (how hard a request is) leave no message out:
@@ -312,6 +379,19 @@ func TestJevLevels(t *testing.T) {
 	_, r = postOK(t, s, "s3", chat("write me a poem", nil, 0, ""))
 	if r.Rule.N != 0 || r.Rule.Classified.Intent != "" {
 		t.Fatalf("topics: %+v", r.Rule.Classified)
+	}
+	// one kind is no scale, whatever Jev would say of it: a message may be
+	// none of it, and "none of these" stands
+	s, _, _, j = jevved(t, "", provider.Rule{Use: "b/big", Intent: "a quick question"})
+	j.choice, j.level, j.sure, j.levels = noIntent, "a quick question", 0.9, 0.9
+	_, r = postOK(t, s, "s4", chat("refactor the parser", nil, 0, ""))
+	if r.Rule.N != 0 || r.Rule.Classified.Intent != "" {
+		t.Fatalf("one kind: %+v", r.Rule.Classified)
+	}
+	j.choice = "a quick question"
+	_, r = postOK(t, s, "s5", chat("what time is it in Tokyo?", nil, 0, ""))
+	if r.Rule.N != 1 || r.Rule.Classified.Intent != "a quick question" || j.n() != 2 { // a turn each, no levels asked about
+		t.Fatalf("one kind picked: %+v, %d calls", r.Rule.Classified, j.n())
 	}
 }
 
@@ -350,6 +430,27 @@ func TestJevPicksTheEffort(t *testing.T) {
 	}
 }
 
+// A turn the agent turned reasoning off in — Hermes sends
+// reasoning_effort "none" — isn't rated: its pick would never be sent,
+// only shown in the route beside the "none" that went (#2247). Nor are
+// its tool rounds given the pick of a turn before.
+func TestJevLeavesReasoningOff(t *testing.T) {
+	s, a, _, j := jevved(t, provider.EffortAuto)
+	j.score = 0.31 // low
+	_, r := postOK(t, s, "s1", chat("look at the repo", nil, 0, `,"reasoning_effort":"high"`))
+	if r.Rule.Pick != "low" || j.n() != 1 || !strings.Contains(a.last, `"reasoning_effort":"low"`) {
+		t.Fatalf("high: %+v %d %s", r.Rule, j.n(), a.last)
+	}
+	_, r = postOK(t, s, "s1", chat("look at the repo", []string{"now fix it"}, 0, `,"reasoning_effort":"none"`))
+	if r.Rule.Pick != "" || r.Rule.Classified != nil || j.n() != 1 || r.Tries[0].Picked {
+		t.Fatalf("none: %+v %+v %d", r.Rule, r.Tries, j.n())
+	}
+	_, r = postOK(t, s, "s1", chat("look at the repo", []string{"now fix it"}, 1, `,"reasoning_effort":"none"`))
+	if r.Rule.Pick != "" || j.n() != 1 || r.Tries[0].Picked {
+		t.Fatalf("none, tool round: %+v %+v %d", r.Rule, r.Tries, j.n())
+	}
+}
+
 // withEffort changes the effort in each API's own words, only where the
 // request asked for reasoning.
 func TestWithEffort(t *testing.T) {
@@ -362,6 +463,9 @@ func TestWithEffort(t *testing.T) {
 		{provider.Chat, `{"model":"m"}`, "high", []string{`{"model":"m"}`}},
 		{provider.Responses, `{"reasoning":{"effort":"medium","summary":"auto"}}`, "xhigh", []string{`"effort":"xhigh"`, `"summary":"auto"`}},
 		{provider.Responses, `{"reasoning":{"effort":"none"}}`, "high", []string{`"effort":"none"`}},
+		// Codex's Responses Lite (gpt-6.1-sol on a ChatGPT account): the
+		// backend turns the request away without context all_turns (#534)
+		{provider.Responses, `{"reasoning":{"effort":"high","summary":"auto","context":"all_turns"}}`, "medium", []string{`"effort":"medium"`, `"summary":"auto"`, `"context":"all_turns"`}},
 		{provider.Anthropic, `{"max_tokens":32000,"thinking":{"type":"adaptive"}}`, "low", []string{`"output_config":{"effort":"low"}`}},
 		{provider.Anthropic, `{"max_tokens":32000,"thinking":{"type":"enabled","budget_tokens":4096}}`, "high", []string{`"budget_tokens":24000`}},
 		{provider.Anthropic, `{"max_tokens":8000,"thinking":{"type":"enabled","budget_tokens":4096}}`, "xhigh", []string{`"budget_tokens":7999`}},
@@ -372,6 +476,35 @@ func TestWithEffort(t *testing.T) {
 			if !strings.Contains(got, w) {
 				t.Errorf("%s %s at %s: %s, want %s", c.proto, c.in, c.effort, got, w)
 			}
+		}
+	}
+}
+
+// A turn at another effort changes nothing of what the vendor caches (#502):
+// for Claude thinking adaptively, output_config's effort alone, its thinking
+// as it was; for the Responses API, reasoning's effort alone — not the
+// instructions, tools, input or prompt_cache_key.
+func TestWithEffortKeepsTheCachedPrefix(t *testing.T) {
+	for _, c := range []struct {
+		proto provider.Protocol
+		in    string
+		field string
+	}{
+		{provider.Anthropic, `{"model":"claude-opus-5-5","max_tokens":32000,"thinking":{"type":"adaptive"},"output_config":{"effort":"max"},"system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":[{"type":"text","text":"a <b> & c","cache_control":{"type":"ephemeral"}}]}]}`, "output_config"},
+		{provider.Responses, `{"model":"gpt-6-astra","instructions":"sys","prompt_cache_key":"thread","reasoning":{"effort":"xhigh","summary":"auto"},"tools":[{"type":"function","name":"read"}],"input":[{"role":"user","content":"a <b> & c"}]}`, "reasoning"},
+	} {
+		lo, hi := withEffort(c.proto, []byte(c.in), "low"), withEffort(c.proto, []byte(c.in), "high")
+		var a, b map[string]json.RawMessage
+		if json.Unmarshal(lo, &a) != nil || json.Unmarshal(hi, &b) != nil {
+			t.Fatalf("%s: %s / %s", c.proto, lo, hi)
+		}
+		for k := range a {
+			if k != c.field && !bytes.Equal(a[k], b[k]) {
+				t.Errorf("%s: %s changed with the effort: %s / %s", c.proto, k, a[k], b[k])
+			}
+		}
+		if bytes.Equal(a[c.field], b[c.field]) {
+			t.Errorf("%s: effort not changed: %s", c.proto, a[c.field])
 		}
 	}
 }
@@ -466,7 +599,7 @@ func TestJevOnVercelTypeSafe(t *testing.T) {
 	j := &jevUp{choice: "crashes", sure: 0.9, score: 2}
 	up := httptest.NewServer(http.StripPrefix("/typesafe", j))
 	defer up.Close()
-	s := jevAt(t, up.URL+"/typesafe", "jv/typesafe-ai/jev", provider.Rule{Use: "b/big", Intent: "crashes"})
+	s := jevAt(t, up.URL+"/typesafe", "jv/typesafe-ai/jev", provider.Rule{Use: "b/big", Intent: "crashes"}, provider.Rule{Use: "a/small", Intent: "renames"})
 	out, r := postOK(t, s, "s1", chat("why does this crash?", nil, 0, `,"reasoning_effort":"low"`))
 	if c := r.Rule.Classified; !strings.Contains(out, "from kb") || c.Intent != "crashes" || c.Sure != 0.9 || r.Rule.Pick != "high" {
 		t.Fatalf("%s %+v %+v", out, r.Rule, c)
@@ -541,7 +674,7 @@ func TestJevOnVercel(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"answers": answers, "usage": map[string]int{"inputTokens": 90}})
 	}))
 	defer up.Close()
-	s := jevAt(t, up.URL+"/v4/ai", "jv/typesafe-ai/jev", provider.Rule{Use: "b/big", Intent: "debugging"})
+	s := jevAt(t, up.URL+"/v4/ai", "jv/typesafe-ai/jev", provider.Rule{Use: "b/big", Intent: "debugging"}, provider.Rule{Use: "a/small", Intent: "docs"})
 	out, r := postOK(t, s, "s1", chat("why does this crash?", nil, 0, `,"reasoning_effort":"low"`))
 	c := r.Rule.Classified
 	if !strings.Contains(out, "from kb") || c.Intent != "debugging" || c.Sure < 0.73 || c.Sure > 0.75 || r.Rule.Pick != "high" {
@@ -590,7 +723,7 @@ func TestJevOnCloudflare(t *testing.T) {
 		}
 	}))
 	defer up.Close()
-	s := jevAt(t, up.URL+"/client/v4", "jv/typesafe/jev", provider.Rule{Use: "b/big", Intent: "debugging"})
+	s := jevAt(t, up.URL+"/client/v4", "jv/typesafe/jev", provider.Rule{Use: "b/big", Intent: "debugging"}, provider.Rule{Use: "a/small", Intent: "docs"})
 	for i, sess := range []string{"s1", "s2"} {
 		out, r := postOK(t, s, sess, chat([]string{"why does this crash?", "and this one?"}[i], nil, 0, `,"reasoning_effort":"low"`))
 		if c := r.Rule.Classified; !strings.Contains(out, "from kb") || c.Intent != "debugging" || c.Sure != 0.9 || r.Rule.Pick != "medium" {
@@ -643,8 +776,55 @@ func TestJevConfidence(t *testing.T) {
 		{map[string]any{"a": 0.5, "b": 0.5}, 0},
 		{map[string]any{"a": 1.0}, 1},
 	} {
-		if got := confidence(c.ps); got < c.want-0.001 || got > c.want+0.001 {
+		if got := provider.Confidence(c.ps); got < c.want-0.001 || got > c.want+0.001 {
 			t.Errorf("%v: %v, want %v", c.ps, got, c.want)
 		}
+	}
+}
+
+// A Clef on Workers AI (ARNO on Discord) is asked at its own run, with
+// the System One request as it is and the model named as Clef names
+// itself, and answers in Cloudflare's envelope.
+func TestClefOnCloudflare(t *testing.T) {
+	j := &jevUp{choice: "crashes", sure: 0.9, score: 1}
+	var models []string
+	var mu sync.Mutex
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/client/v4/accounts/acc7/ai/run/@cf/cloudflare/clef-flash" || r.Header.Get("Authorization") != "Bearer kj" {
+			http.Error(w, `{"success":false,"errors":[{"message":"No route for that URI"}]}`, 400)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		var q map[string]any
+		json.Unmarshal(b, &q)
+		if _, ok := q["input"]; ok || q["questions"] == nil {
+			http.Error(w, `{"success":false,"errors":[{"message":"bad input"}]}`, 400)
+			return
+		}
+		// Clef turns away a choice of fewer than two options, as Workers AI
+		// answered one with a single intent rule's level question
+		for _, v := range q["questions"].(map[string]any) {
+			if x := v.(map[string]any); x["type"] == "choice" && len(x["criteria"].(map[string]any)) < 2 {
+				http.Error(w, `{"errors":[{"message":"AiError: AiError: {\"error\":{\"type\":\"invalid_request\",\"message\":\"Request body failed validation\",\"details\":{\"formErrors\":[],\"fieldErrors\":{\"questions\":[\"Dictionary should have at least 2 items after validation, not 1\"]}}}} (5a7c7e33-f74b-4b92-a602-47898cef2bfd)","code":5012}],"success":false,"result":{},"messages":[]}`, 422)
+				return
+			}
+		}
+		mu.Lock()
+		models = append(models, fmt.Sprint(q["model"]))
+		mu.Unlock()
+		rec := httptest.NewRecorder()
+		j.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/systemone", bytes.NewReader(b)))
+		w.Write([]byte(`{"success":true,"errors":[],"messages":[],"result":` + rec.Body.String() + `}`))
+	}))
+	defer up.Close()
+	s := jevAt(t, up.URL+"/client/v4/accounts/acc7/ai/run", "jv/@cf/cloudflare/clef-flash", provider.Rule{Use: "b/big", Intent: "crashes"})
+	out, r := postOK(t, s, "s1", chat("why does this crash?", nil, 0, `,"reasoning_effort":"low"`))
+	if c := r.Rule.Classified; !strings.Contains(out, "from kb") || c.Intent != "crashes" || c.Sure != 0.9 {
+		t.Fatalf("%s %+v %+v", out, r.Rule, c)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(models) == 0 || slices.ContainsFunc(models, func(m string) bool { return m != "clef-flash" }) {
+		t.Fatalf("Clef asked as %v", models)
 	}
 }

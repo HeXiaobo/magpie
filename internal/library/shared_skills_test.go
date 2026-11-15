@@ -24,8 +24,11 @@ func symlink(t *testing.T, to, at string) {
 // shared folder as it is.
 func TestSharedAgentsSkills(t *testing.T) {
 	h := sandbox(t)
-	// no agent here whose own folder the shared one is (Goose's)
+	// no agent here whose own folder the shared one is (Goose's): its CLI
+	// of the sandbox too, since that alone would have it here (#2177)
 	os.RemoveAll(filepath.Join(h, ".config/goose"))
+	os.Remove(filepath.Join(h, "bin/goose"))
+	os.Remove(filepath.Join(h, "bin/goose.exe"))
 	shared := filepath.Join(h, ".agents/skills")
 	// a skill kept elsewhere (D:\aimer-skills\…) linked into the shared folder
 	ext := filepath.Join(h, "aimer-skills/grilling")
@@ -95,11 +98,16 @@ func TestSharedAgentsSkills(t *testing.T) {
 			t.Errorf("the library's %s isn't a link to %s", n, want)
 		}
 	}
-	// the agents that had it have the library's, and so has the one with a
-	// byte copy of its own, kept aside with the backups
-	for _, d := range []string{".pi/agent/skills/orchestration", ".codex/skills/orchestration", ".gemini/skills/grilling", ".codex/skills/orca-cli"} {
-		if !ours(filepath.Join(h, d), filepath.Base(d)) {
-			t.Errorf("%s isn't the library's", d)
+	// the agents that had it have the library's; Codex and Gemini CLI read
+	// ~/.agents/skills, where all three are kept, so a link in their own
+	// folders would be each skill twice (#595): they get none, and Codex's
+	// byte copy of its own is kept aside with the backups
+	if !ours(filepath.Join(h, ".pi/agent/skills/orchestration"), "orchestration") {
+		t.Error("pi's orchestration isn't the library's")
+	}
+	for _, d := range []string{".codex/skills/orchestration", ".gemini/skills/grilling", ".codex/skills/orca-cli"} {
+		if _, err := os.Lstat(filepath.Join(h, d)); !os.IsNotExist(err) {
+			t.Errorf("%s is there, besides the shared folder's: %v", d, err)
 		}
 	}
 	if m, _ := filepath.Glob(filepath.Join(BackupDir(), "*", "codex", "skills", "orca-cli", "SKILL.md")); len(m) != 1 {
@@ -109,6 +117,15 @@ func TestSharedAgentsSkills(t *testing.T) {
 	for _, s := range v.Skills {
 		if s.Kind != "folder" {
 			t.Errorf("%s: %+v", s.Name, s)
+		}
+		// every agent reading the shared folder has it, ticked or not
+		for _, id := range []string{"codex", "gemini"} {
+			if !slices.Contains(s.Always, id) {
+				t.Errorf("%s: %s isn't said to have it always: %v", s.Name, id, s.Always)
+			}
+		}
+		if slices.Contains(s.Always, "pi") || slices.Contains(s.Always, "claude") {
+			t.Errorf("%s: always %v", s.Name, s.Always)
 		}
 	}
 	if byName := found(); len(byName) != 0 {

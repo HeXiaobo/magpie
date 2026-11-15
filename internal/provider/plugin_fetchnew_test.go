@@ -6,13 +6,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // A plugin's account listed with the plugin's providers is not asked for
@@ -20,10 +20,7 @@ import (
 // the Providers page built its state through FetchNew, and every ten
 // minutes asked every plugin's vendors for their lists again.
 func TestFetchNewLeavesListedPlugins(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -42,6 +39,10 @@ func TestFetchNewLeavesListedPlugins(t *testing.T) {
 	if p, err := Find("fakeco"); err != nil || !p.IsPlugin() || !p.Ready() {
 		t.Fatalf("Find(fakeco) = %+v, %v", p, err)
 	}
+	// signing in kicked off a refresh of the plugins' providers in the
+	// background (Cached, after the auth event); one still running
+	// rewrites the list below and reads as FetchNew asking again
+	plugin.Refreshed()
 	was := newFetchRetry
 	newFetchRetry = 0
 	t.Cleanup(func() { newFetchRetry = was })
@@ -60,10 +61,7 @@ func TestFetchNewLeavesListedPlugins(t *testing.T) {
 // plugin:<id> (routing) is read from the vendor once, as a built-in's,
 // asked for by one name, is.
 func TestPluginUsageReadOnceWhicheverName(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
