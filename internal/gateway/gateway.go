@@ -4490,6 +4490,27 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			wentTier = t
 		}
 		ended = time.Now()
+		// A vendor's refusal that magpie could not put in its own words is
+		// kept whole before the short line replaces it: the body, the
+		// content type and the vendor's own request id, so "Codex: Bad
+		// Request" can be taken back to the vendor afterwards. A refusal
+		// magpie named itself (an overflow, a quota, a safety filter) is
+		// not kept — its own words already say what happened.
+		if !hw.passing && call.Status >= 400 && !hw.refused && hw.looped == "" && !outgrew {
+			id, name := callerKeyOf(r.Context())
+			KeepErrBody(ErrBodyRecord{
+				Provider:    c.p.ID,
+				Model:       c.model,
+				Effort:      wentAt,
+				RouteID:     c.rest,
+				CallerKey:   name,
+				CallerKeyID: id,
+				Status:      call.Status,
+				ContentType: hw.header.Get("Content-Type"),
+				UpstreamID:  upstreamRequestID(hw.header),
+				Body:        string(hw.errBody()),
+			})
+		}
 		try := Try{ID: c.rest, Model: c.model, Effort: wentAt, Picked: picked, Fixed: fixed, RuleEffort: ruled, MappedFrom: mappedFrom, Fast: fast, Start: began, Done: true, Status: call.Status, Millis: ended.Sub(began).Milliseconds(), Error: call.Error, Queued: queued,
 			Served: call.Usage.Served, Upstream: call.Usage.Upstream, Pin: c.p.ClinePassAsked(c.model), Tier: wentTier, TierServed: call.Usage.Tier, Auto: autoPicked(),
 			Net: nt.timing(began, queued), SentBy: sentBy(c.p)}
